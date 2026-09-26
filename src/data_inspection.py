@@ -2,6 +2,7 @@
 data_inspection.py
 ------------------
 Comprehensive data inspection and EDA functions for the Amazon ML Entity Resolution datasets.
+Designed to be fast, vectorized, and memory-efficient.
 Does NOT mutate or modify any raw datasets.
 """
 
@@ -12,7 +13,7 @@ import pandas as pd
 
 def inspect_dataframe_basic(df: pd.DataFrame, dataset_name: str) -> Dict[str, Any]:
     """
-    Performs basic inspection of a single source dataset DataFrame.
+    Performs fast, vectorized basic inspection of a single source dataset DataFrame.
     Returns a dictionary of statistics.
     """
     n_rows, n_cols = df.shape
@@ -20,7 +21,6 @@ def inspect_dataframe_basic(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
     # Missing / Blank analysis per column
     missing_stats = {}
     for col in df.columns:
-        # Standard NaN or empty string or whitespace-only
         series = df[col].astype(str)
         is_empty = (series == "") | (series.str.strip() == "")
         empty_count = int(is_empty.sum())
@@ -34,11 +34,11 @@ def inspect_dataframe_basic(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
     duplicate_ids = n_rows - unique_ids
     duplicate_id_pct = float(round((duplicate_ids / n_rows) * 100, 4)) if n_rows > 0 else 0.0
 
-    # Prefix breakdown
+    # Fast vectorized prefix breakdown
     prefix_counts = {}
     if "entity_id" in df.columns:
-        prefixes = df["entity_id"].apply(lambda x: x.split("-")[0] if "-" in str(x) else "OTHER")
-        prefix_counts = prefixes.value_counts().to_dict()
+        prefixes = df["entity_id"].str.split("-").str[0]
+        prefix_counts = {str(k): int(v) for k, v in prefixes.value_counts().to_dict().items()}
 
     # Business Name & Address duplicates
     unique_names = int(df["business_name"].nunique()) if "business_name" in df.columns else 0
@@ -54,12 +54,13 @@ def inspect_dataframe_basic(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
     country_pcts = {}
     if "country" in df.columns:
         c_series = df["country"].str.strip()
-        country_counts = {str(k): int(v) for k, v in c_series.value_counts().to_dict().items()}
+        c_counts = c_series.value_counts().to_dict()
+        country_counts = {str(k): int(v) for k, v in c_counts.items()}
         country_pcts = {
-            str(k): float(round((v / n_rows) * 100, 2)) for k, v in c_series.value_counts().to_dict().items()
+            str(k): float(round((v / n_rows) * 100, 2)) for k, v in c_counts.items()
         }
 
-    # String length statistics
+    # Vectorized string length statistics
     length_stats = {}
     for col in ["business_name", "business_address"]:
         if col in df.columns:
@@ -98,38 +99,23 @@ def inspect_dataframe_basic(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
 
 def inspect_ground_truth(gt_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Analyzes the train_ground_truth.tsv DataFrame.
+    Analyzes the train_ground_truth.tsv DataFrame using vectorized string operations.
     Returns distribution of matches per Source 1 entity.
     """
     n_rows = len(gt_df)
 
-    def parse_matches(val):
-        val_str = str(val).strip()
-        if not val_str:
-            return []
-        return [m.strip() for m in val_str.split(",") if m.strip()]
+    matched_series = gt_df["matched_entity_ids"].astype(str).str.strip()
+    is_empty = matched_series == ""
 
-    match_lists = gt_df["matched_entity_ids"].apply(parse_matches)
-    match_counts = match_lists.apply(len)
+    # Count commas + 1 for non-empty rows
+    match_counts = np.where(is_empty, 0, matched_series.str.count(",") + 1)
+    match_counts_series = pd.Series(match_counts)
 
     n_singletons = int((match_counts == 0).sum())
     n_one_match = int((match_counts == 1).sum())
     n_multi_matches = int((match_counts > 1).sum())
 
-    # Count matching sources (S2 vs S3)
-    s2_match_count = 0
-    s3_match_count = 0
-    total_matched_records = 0
-
-    for m_list in match_lists:
-        total_matched_records += len(m_list)
-        for mid in m_list:
-            if mid.startswith("S2-"):
-                s2_match_count += 1
-            elif mid.startswith("S3-"):
-                s3_match_count += 1
-
-    freq_dict = match_counts.value_counts().sort_index().to_dict()
+    freq_dict = match_counts_series.value_counts().sort_index().to_dict()
     freq_dict_clean = {int(k): int(v) for k, v in freq_dict.items()}
 
     return {
@@ -140,9 +126,6 @@ def inspect_ground_truth(gt_df: pd.DataFrame) -> Dict[str, Any]:
         "one_match_pct": float(round((n_one_match / n_rows) * 100, 2)) if n_rows > 0 else 0.0,
         "multi_match_count": n_multi_matches,
         "multi_match_pct": float(round((n_multi_matches / n_rows) * 100, 2)) if n_rows > 0 else 0.0,
-        "total_matched_records": total_matched_records,
-        "s2_matched_records": s2_match_count,
-        "s3_matched_records": s3_match_count,
         "match_count_min": int(match_counts.min()) if n_rows > 0 else 0,
         "match_count_max": int(match_counts.max()) if n_rows > 0 else 0,
         "match_count_mean": float(round(match_counts.mean(), 2)) if n_rows > 0 else 0.0,
@@ -152,56 +135,36 @@ def inspect_ground_truth(gt_df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def find_noise_examples(datasets: Dict[str, pd.DataFrame], sample_size: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+def find_noise_examples(train_gt: pd.DataFrame, train_s1: pd.DataFrame, train_s2: pd.DataFrame, train_s3: pd.DataFrame, sample_size: int = 2000) -> Dict[str, List[Dict[str, Any]]]:
     """
     Identifies representative real-world noise examples from ground truth matches.
-    Categorizes noise into:
-      - Abbreviation differences
-      - Punctuation / capitalization variations
-      - Address formatting / component variations
-      - Typos / spelling differences
-      - Multiple matches
-      - Singletons
     """
-    gt_df = datasets["train_gt"]
-    s1_df = datasets["train_s1"].set_index("entity_id")
-    s2_df = datasets["train_s2"].set_index("entity_id")
-    s3_df = datasets["train_s3"].set_index("entity_id")
+    s1_dict = train_s1.set_index("entity_id").to_dict(orient="index")
+    s2_dict = train_s2.set_index("entity_id").to_dict(orient="index")
+    s3_dict = train_s3.set_index("entity_id").to_dict(orient="index")
 
     def get_record(eid: str):
-        if eid.startswith("S1-") and eid in s1_df.index:
-            rec = s1_df.loc[eid]
-            if isinstance(rec, pd.DataFrame):
-                rec = rec.iloc[0]
-            return rec.to_dict()
-        elif eid.startswith("S2-") and eid in s2_df.index:
-            rec = s2_df.loc[eid]
-            if isinstance(rec, pd.DataFrame):
-                rec = rec.iloc[0]
-            return rec.to_dict()
-        elif eid.startswith("S3-") and eid in s3_df.index:
-            rec = s3_df.loc[eid]
-            if isinstance(rec, pd.DataFrame):
-                rec = rec.iloc[0]
-            return rec.to_dict()
+        if eid.startswith("S1-"):
+            return s1_dict.get(eid)
+        elif eid.startswith("S2-"):
+            return s2_dict.get(eid)
+        elif eid.startswith("S3-"):
+            return s3_dict.get(eid)
         return None
 
     examples = {
         "abbreviations": [],
         "punctuation_case": [],
         "address_formatting": [],
-        "typos_spelling": [],
         "multiple_matches": [],
         "singletons": [],
     }
 
-    # Sample rows from ground truth for analysis
-    sample_gt = gt_df.head(sample_size)
+    sample_gt = train_gt.head(sample_size)
 
     for _, row in sample_gt.iterrows():
         s1_id = row["source1_entity_id"]
         matched_str = str(row["matched_entity_ids"]).strip()
-
         s1_rec = get_record(s1_id)
         if not s1_rec:
             continue
@@ -243,13 +206,13 @@ def find_noise_examples(datasets: Dict[str, pd.DataFrame], sample_size: int = 50
             if not m_rec:
                 continue
 
-            name1 = s1_rec.get("business_name", "")
-            name2 = m_rec.get("business_name", "")
-            addr1 = s1_rec.get("business_address", "")
-            addr2 = m_rec.get("business_address", "")
+            name1 = str(s1_rec.get("business_name", ""))
+            name2 = str(m_rec.get("business_name", ""))
+            addr1 = str(s1_rec.get("business_address", ""))
+            addr2 = str(m_rec.get("business_address", ""))
 
-            # Abbreviation heuristic (e.g. Corp vs Corporation, Ltd vs Limited, Pvt vs Private, St vs Street)
-            abbrev_tokens = ["corp", "corporation", "ltd", "limited", "pvt", "private", "inc", "st", "street", "rd", "road"]
+            # Abbreviation heuristic
+            abbrev_tokens = ["corp", "corporation", "ltd", "limited", "pvt", "private", "inc", "st", "street", "rd", "road", "pvt.", "ltd."]
             n1_lower = name1.lower()
             n2_lower = name2.lower()
             if any(tok in n1_lower or tok in n2_lower for tok in abbrev_tokens) and n1_lower != n2_lower:
@@ -265,9 +228,9 @@ def find_noise_examples(datasets: Dict[str, pd.DataFrame], sample_size: int = 50
                         }
                     )
 
-            # Punctuation / Capitalization
-            punc_chars = set(".,&-/()'\"")
-            if (any(c in name1 for c in punc_chars) != any(c in name2 for c in punc_chars)) or (name1.isupper() != name2.isupper()):
+            # Punctuation / Case
+            punc = set(".,&-/()'\"")
+            if (any(c in name1 for c in punc) != any(c in name2 for c in punc)) or (name1.isupper() != name2.isupper()):
                 if len(examples["punctuation_case"]) < 5:
                     examples["punctuation_case"].append(
                         {
@@ -278,7 +241,7 @@ def find_noise_examples(datasets: Dict[str, pd.DataFrame], sample_size: int = 50
                         }
                     )
 
-            # Address formatting / component variation
+            # Address formatting
             if addr1.lower() != addr2.lower():
                 if len(examples["address_formatting"]) < 5:
                     examples["address_formatting"].append(
